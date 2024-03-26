@@ -1,0 +1,98 @@
+# Doc: https://confluence.atlassian.com/bitbucket/configure-bitbucket-pipelines-yml-792298910.html
+definitions:
+  steps:
+     - step: &SF-Deploy
+          name: SF-Deploy
+          image: jfgarcia268/vlocity_sfdx:latest
+          script:
+            - source ./set_sfdx_url.sh
+            - echo ${URL} > env.sfdx
+            - sfdx force:auth:sfdxurl:store -d -a ${URL} -f env.sfdx
+            - rm -rf env.sfdx
+            - sfdx vlocityestools:sfsource:createdeltapackage -u ${URL} -p cmt -d force-app -c Generalsettings__c -v VBTDeploykey_SF
+            - if [ -d force-app_delta ]; then
+            -    if [ -d force-app_delta/main/default/profiles ]; then
+            -       rm -rf force-app_delta/main/default/profiles
+            -    fi
+            -    echo "Running the Deployment"
+            -    sfdx force:source:deploy --sourcepath force-app_delta -u ${URL} --verbose --ignorewarnings
+            -    head_commit=$(git rev-parse HEAD)
+            -    sfdx force:data:record:update -s GeneralSettings__c  -w "Name='VBTDeployKey_SF'" -v "Value__c='$head_commit'" -u ${URL}
+            - else
+            -    echo "No Delta Folder Found ."
+            - fi
+pipelines: 
+  pull-requests:
+    '{feature/*,defect/*,Bugfix/*,bugfix/*}':
+      - step:
+          name: Validation against vlty
+          image: jfgarcia268/vlocity_sfdx:latest
+          script:
+            - echo ${sfdx_url_testvs} > env.sfdx
+            - sfdx force:auth:sfdxurl:store -s -a UAT -f env.sfdx
+            - rm -rf env.sfdx
+            - echo $BITBUCKET_PR_DESTINATION_BRANCH
+            - key_suffix=$(echo $BITBUCKET_COMMIT | cut -c -7)
+            - echo $key_suffix   
+            - update_hash=$(git merge-base HEAD origin/$BITBUCKET_PR_DESTINATION_BRANCH)
+            - echo $update_hash
+            - key_name=$(echo VBTDeployKey$key_suffix)
+            - echo $key_name
+            - echo export key_name=$key_name > set_variables.sh
+            - if [ -z "$(sfdx force:data:record:get -s GeneralSettings__c -w "Name=$key_name" -u UAT | grep -i Name)" ]; then
+            -    sfdx force:data:record:create -s GeneralSettings__c  -v "Name='$key_name' Value__c='$update_hash'" -u UAT
+            - else
+            -    sfdx force:data:record:update -s GeneralSettings__c  -w "Name='$key_name'" -v "Value__c='$update_hash'" -u UAT
+            - fi
+            - sfdx vlocityestools:sfsource:createdeltapackage -u UAT -p cmt -d force-app --gitcheckkey $key_suffix
+            - |
+              if [ -d "force-app_delta" ]; then
+                # rm -rf force-app_delta/main/default/profiles
+                 if [ -d force-app_delta/main/default/classes ];then
+                    echo "Checking for the test classes"
+                    bash -x fetch_test_classes.sh UAT
+                    if [ $? -ne 0 ];then
+                       echo "Test class execution has failed"
+                       exit 1
+                    fi
+                 else
+                    sfdx force:source:deploy -c  --sourcepath force-app_delta --targetusername UAT --verbose --ignorewarnings
+                 fi
+                 # if [ $(find force-app_delta/main/default/objects -type d 2>/dev/null| grep -i fields |  wc -l) -gt 0 ];then
+                  #  echo ${sfdx_url_dev} > env.sfdx
+                  #  sfdx force:auth:sfdxurl:store -s -a dev -f env.sfdx
+                  #  rm -rf env.sfdx
+                  # ls force-app_delta/main/default/objects | while read line
+                  #  do
+                     # if [ -d force-app_delta/main/default/objects/$line/fields ];then
+                      # sfdx force:source:deploy  --sourcepath force-app_delta/main/default/objects/$line/fields --target-org | -o dev --verbose --ignorewarnings || true
+                     # fi
+                   # done
+                # fi
+              else
+                    echo "No SF changes found"
+              fi
+          artifacts:
+            - set_variables.sh
+          after-script:
+            - source ./set_variables.sh
+            - echo ${sfdx_url_testvs} > env.sfdx
+            - sfdx force:auth:sfdxurl:store -s -a UAT -f env.sfdx
+            - rm -rf env.sfdx
+            - if [ "$key_name" == "VBTDeployKey" ];then
+            -    echo "$key_name is incorrect"
+            - else
+            -    sfdx force:data:record:delete -s GeneralSettings__c -w "Name='$key_name'" -u UAT
+            - fi
+  custom:
+    testvsDeploy:
+      - step:
+          name: Build
+          script:
+            - echo export URL=${sfdx_url_testvs} > set_sfdx_url.sh
+          artifacts: # define the artifacts to be passed to each future step
+            - set_sfdx_url.sh
+      - step:
+          <<: *SF-Deploy
+          name: Deploy to testvs
+          deployment: testvs
